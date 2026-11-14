@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,7 @@ import (
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -1680,5 +1682,101 @@ func TestPeerKey(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Errorf("timeout waiting for the %s handler", tt.proto)
 		}
+	}
+}
+
+func TestFilterTailscaleEndpoints(t *testing.T) {
+	ap := netip.MustParseAddrPort
+	tests := []struct {
+		name string
+		in   []netip.AddrPort
+		want []netip.AddrPort
+	}{
+		{
+			name: "drops_tailscale_addrs_keeps_rest",
+			in: []netip.AddrPort{
+				ap("192.168.1.2:1234"),              // LAN
+				ap("100.64.0.1:1234"),               // Tailscale CGNAT
+				ap("[fd7a:115c:a1e0:ab12::1]:1234"), // Tailscale ULA
+				ap("203.0.113.5:1234"),              // public
+			},
+			want: []netip.AddrPort{
+				ap("192.168.1.2:1234"),
+				ap("203.0.113.5:1234"),
+			},
+		},
+		{
+			name: "only_tailscale_addrs_kept_as_last_resort",
+			in: []netip.AddrPort{
+				ap("100.64.0.1:1234"),
+				ap("[fd7a:115c:a1e0:ab12::1]:1234"),
+			},
+			want: []netip.AddrPort{
+				ap("100.64.0.1:1234"),
+				ap("[fd7a:115c:a1e0:ab12::1]:1234"),
+			},
+		},
+		{
+			name: "non_tailscale_ula_kept",
+			in: []netip.AddrPort{
+				ap("[fd00::1]:1234"),
+				ap("100.64.0.1:1234"),
+			},
+			want: []netip.AddrPort{ap("[fd00::1]:1234")},
+		},
+		{
+			name: "ipv4_mapped_tailscale_dropped",
+			in: []netip.AddrPort{
+				ap("[::ffff:100.64.0.1]:1234"),
+				ap("192.168.1.2:1234"),
+			},
+			want: []netip.AddrPort{ap("192.168.1.2:1234")},
+		},
+		{
+			name: "no_tailscale_addrs_unchanged",
+			in: []netip.AddrPort{
+				ap("192.168.1.2:1234"),
+				ap("203.0.113.5:1234"),
+			},
+			want: []netip.AddrPort{
+				ap("192.168.1.2:1234"),
+				ap("203.0.113.5:1234"),
+			},
+		},
+		{
+			name: "empty",
+			in:   nil,
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterTailscaleEndpoints(tt.in)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("filterTailscaleEndpoints(%v) = %v; want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOnEngineStatusFiltersTailscaleEndpoints is the end-to-end check
+// for tailscale/tailcat#168: magicsock reports the tailscale0 interface
+// address among our local endpoints, and it must not be advertised to
+// peers as a direct path.
+func TestOnEngineStatusFiltersTailscaleEndpoints(t *testing.T) {
+	ap := netip.MustParseAddrPort
+	b := &locoBackend{}
+	b.onEngineStatus(&wgengine.Status{
+		LocalAddrs: []tailcfg.Endpoint{
+			{Addr: ap("192.168.1.2:41641")},
+			{Addr: ap("100.64.0.1:41641")},
+			{Addr: ap("[fd7a:115c:a1e0:ab12::1]:41641")},
+		},
+	}, nil)
+	want := []netip.AddrPort{ap("192.168.1.2:41641")}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !slices.Equal(b.eps, want) {
+		t.Errorf("onEngineStatus stored endpoints = %v; want %v", b.eps, want)
 	}
 }

@@ -362,7 +362,7 @@ type locoBackend struct {
 	nextClientID tailcfg.NodeID                   // for the server; never reused after a removal
 	pendingAllow map[key.NodePublic]bool          // client keys with an allowClient call in flight
 	nm           *netmap.NetworkMap
-	eps          []netip.AddrPort // our current local UDP endpoints, sorted
+	eps          []netip.AddrPort // our current local UDP endpoints, sorted, excluding Tailscale addresses (see filterTailscaleEndpoints)
 	closeOnce    sync.Once
 }
 
@@ -1541,12 +1541,36 @@ func (b *locoBackend) peerForIP(ip netip.Addr) (_ wgengine.PeerForIP, ok bool) {
 	return zero, false
 }
 
+// filterTailscaleEndpoints drops Tailscale addresses (100.64.0.0/10 and
+// fd7a:115c:a1e0::/48) from eps. A direct path through a peer's Tailscale
+// address runs our WireGuard inside Tailscale's WireGuard, through a
+// 1280-byte-MTU tun device, and on Linux batched (GSO) sends over such a
+// path mostly never arrive, collapsing throughput to tens of KB/s
+// (tailscale/tailcat#168). A Tailscale address is never a better direct
+// path than a plain LAN or public address. If dropping them would leave
+// no endpoints at all, eps is returned unchanged, so a node whose only
+// path is its Tailscale address can still connect directly instead of
+// falling back to DERP.
+func filterTailscaleEndpoints(eps []netip.AddrPort) []netip.AddrPort {
+	out := make([]netip.AddrPort, 0, len(eps))
+	for _, ep := range eps {
+		if !tsaddr.IsTailscaleIP(ep.Addr()) {
+			out = append(out, ep)
+		}
+	}
+	if len(out) == 0 {
+		return eps
+	}
+	return out
+}
+
 // onEngineStatus is the wgengine status callback. It watches for
 // changes to our magicsock UDP endpoints (learned via STUN and from
 // local interfaces) and advertises them to all current peers. Tailcat
 // has no control plane distributing endpoints, and magicsock never
 // attempts a direct path to a peer with no known endpoints, so these
 // advertisements are what make direct connections possible at all.
+// Tailscale addresses are not advertised (see filterTailscaleEndpoints).
 func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	if err != nil || st == nil {
 		return
@@ -1557,6 +1581,7 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	}
 	slices.SortFunc(eps, func(a, b netip.AddrPort) int { return a.Compare(b) })
 	eps = slices.Compact(eps)
+	eps = filterTailscaleEndpoints(eps)
 	b.mu.Lock()
 	changed := !slices.Equal(eps, b.eps)
 	if changed {
