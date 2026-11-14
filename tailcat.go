@@ -1541,6 +1541,25 @@ func (b *locoBackend) peerForIP(ip netip.Addr) (_ wgengine.PeerForIP, ok bool) {
 	return zero, false
 }
 
+// advertisedEndpoints returns the endpoints tailcat should advertise to
+// peers: our magicsock UDP endpoints, minus any on a Tailscale interface.
+// A peer that picks a Tailscale address (100.64.0.0/10 or
+// fd7a:115c:a1e0::/48) as its direct path runs its WireGuard inside
+// Tailscale's WireGuard, through a 1280-byte-MTU tunnel, where batched
+// (GSO) sends from Linux mostly never arrive (tailscale/tailcat#168).
+// The plain LAN and STUN endpoints remain, so direct connections are
+// unaffected; a peer with no other endpoint falls back to the DERP relay.
+func advertisedEndpoints(eps []netip.AddrPort) []netip.AddrPort {
+	out := make([]netip.AddrPort, 0, len(eps))
+	for _, ep := range eps {
+		if tsaddr.IsTailscaleIP(ep.Addr()) {
+			continue
+		}
+		out = append(out, ep)
+	}
+	return out
+}
+
 // onEngineStatus is the wgengine status callback. It watches for
 // changes to our magicsock UDP endpoints (learned via STUN and from
 // local interfaces) and advertises them to all current peers. Tailcat
@@ -1555,6 +1574,7 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	for _, ep := range st.LocalAddrs {
 		eps = append(eps, ep.Addr)
 	}
+	eps = advertisedEndpoints(eps)
 	slices.SortFunc(eps, func(a, b netip.AddrPort) int { return a.Compare(b) })
 	eps = slices.Compact(eps)
 	b.mu.Lock()
